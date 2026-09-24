@@ -1,0 +1,21 @@
+# secrets — never commit
+.env
+*.env
+!.env.example
+
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+dist/
+build/
+*.spec
+
+logs/*.log
+logs/*.csv
+fcos_daily_state.json
+fcos_config.json
+
+.idea/
+.DS_Store
