@@ -121,9 +121,10 @@ class RestCandleFeed:
         raw = self.fetch_1m(sec, seg, inst)
         self.polls += 1
         now = self.clock()
-        if self.on_poll:
-            self.on_poll(leg, now)
         if not raw:
+            # A failed or empty fetch proves nothing about this leg. It must
+            # NEVER count as "polled" — during the 29-Sep DNS outage it did,
+            # and BarSync released two hours of candles without spot.
             return
         raw = self.drop_forming(raw, now)
         if self.session_anchor:
@@ -146,6 +147,10 @@ class RestCandleFeed:
             self.last_bar_at = now
             self._last_ts[leg] = b["ts"]
             self.on_bar(leg, b)
+        # Report progress only after this poll's bars are handed over, so
+        # BarSync can never treat the leg as past a bar it is about to add.
+        if self.on_poll:
+            self.on_poll(leg, now, max(int(c["ts"]) for c in raw))
 
     def health(self) -> dict:
         lat = self.latencies[-50:]
@@ -156,35 +161,42 @@ class RestCandleFeed:
 
 class BarSync:
     """
-    Release one Bundle per 5-minute timestamp once every leg has either
-    delivered that bar, moved past it, or been polled well after it closed
-    without producing it (an illiquid option minute). Always in order.
+    Release one Bundle per 5-minute timestamp, in order, once every leg has
+    either delivered that bar or has REAL data past it (a later completed
+    minute), which means that leg genuinely had no trades in the bar — an
+    illiquid option. Time alone never releases a bar: during a network
+    outage nothing is released, and the backlog is released in order, with
+    spot, as soon as every leg's data is back.
     """
 
     def __init__(self, legs: List[str], on_bundle: Callable, period: int = 5,
-                 grace: float = 20.0, clock: Callable[[], float] = time.time):
+                 clock: Callable[[], float] = time.time):
         self.legs = list(legs)
         self.on_bundle = on_bundle
         self.span = period * 60
-        self.grace = grace
         self.clock = clock
         self._bars: Dict[int, Dict[str, dict]] = {}
         self._last_emitted_leg: Dict[str, int] = {l: 0 for l in legs}
-        self._last_poll: Dict[str, float] = {l: 0.0 for l in legs}
+        self._data_through: Dict[str, int] = {l: 0 for l in legs}
         self._released = 0
+        self.late_dropped = 0
         self._lock = threading.RLock()
 
     def add(self, leg: str, bar: dict):
         with self._lock:
             if bar["ts"] <= self._released:
+                self.late_dropped += 1
+                log.warning(f"  [{leg}] bar {bar['ts']} arrived after its slot was "
+                            f"released — ignored")
                 return
             self._bars.setdefault(bar["ts"], {})[leg] = bar
             self._last_emitted_leg[leg] = max(self._last_emitted_leg[leg], bar["ts"])
             self.pump()
 
-    def polled(self, leg: str, at: float):
+    def polled(self, leg: str, at: float, last_minute_ts: int = 0):
+        """A SUCCESSFUL poll: `last_minute_ts` is the leg's latest completed minute."""
         with self._lock:
-            self._last_poll[leg] = at
+            self._data_through[leg] = max(self._data_through[leg], int(last_minute_ts or 0))
             self.pump()
 
     def _leg_done(self, leg: str, ts: int, have: Dict[str, dict]) -> bool:
@@ -192,19 +204,21 @@ class BarSync:
             return True
         if self._last_emitted_leg[leg] > ts:
             return True
-        return self._last_poll[leg] >= ts + self.span + self.grace
+        return self._data_through[leg] >= ts + self.span
 
     def pump(self):
         with self._lock:
             while self._bars:
                 ts = min(self._bars)
                 have = self._bars[ts]
+                if "SPOT" not in have and not self._leg_done("SPOT", ts, have):
+                    return                      # never release ahead of spot
                 if not all(self._leg_done(l, ts, have) for l in self.legs):
                     return
                 del self._bars[ts]
                 self._released = ts
                 if "SPOT" not in have:
-                    log.warning(f"  bar {ts}: no spot candle — skipped")
+                    log.warning(f"  bar {ts}: spot data has no candle here — skipped")
                     continue
                 lag = max(b.get("lag", 0.0) for b in have.values())
                 lag = max(lag, self.clock() - (ts + self.span))

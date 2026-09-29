@@ -346,19 +346,39 @@ def hhmm(s: str):
 # REST
 # ═══════════════════════════════════════════════════════════════════════════
 
-_ERR_SEEN: Dict[Tuple[str, int], Tuple[float, int]] = {}
+_ERR_SEEN: Dict[Tuple[str, str], Tuple[float, int]] = {}
 
 
-def _log_api_error(endpoint: str, code: int, body: str):
-    key = (endpoint, code)
+def log_throttled(key: Tuple[str, str], msg: str, level=logging.ERROR, every: float = 60.0):
+    """
+    Log a repeating message at most once per `every` seconds, with a count of
+    how many were suppressed. A two-hour network outage on 29-Sep wrote 5,230
+    near-identical lines; this keeps it to one line a minute per error kind.
+    """
     now = time.time()
     last, hidden = _ERR_SEEN.get(key, (0.0, 0))
-    if now - last > 60:
+    if now - last > every:
         extra = f"  ({hidden} identical suppressed)" if hidden else ""
-        log.error(f"  API {endpoint} -> HTTP {code}: {body[:160]}{extra}")
+        log.log(level, f"{msg}{extra}")
         _ERR_SEEN[key] = (now, 0)
     else:
         _ERR_SEEN[key] = (last, hidden + 1)
+
+
+def _log_api_error(endpoint: str, code: int, body: str):
+    log_throttled((endpoint, f"HTTP{code}"),
+                  f"  API {endpoint} -> HTTP {code}: {body[:160]}")
+
+
+def _net_kind(e: Exception) -> str:
+    t = str(e)
+    if "NameResolution" in t or "getaddrinfo" in t:
+        return "DNS"
+    if "Timeout" in type(e).__name__ or "timed out" in t:
+        return "TIMEOUT"
+    if "Connection" in type(e).__name__ or "Connection" in t:
+        return "CONNECTION"
+    return type(e).__name__
 
 
 def api_post(endpoint: str, payload: dict, retries: int = 2, timeout: float = 15):
@@ -391,12 +411,18 @@ def api_post(endpoint: str, payload: dict, retries: int = 2, timeout: float = 15
             if att < retries:
                 time.sleep(1.5)
         except requests.exceptions.Timeout:
-            log.error(f"  API {endpoint} TIMED OUT after {timeout}s "
-                      f"(attempt {att + 1}/{retries + 1})")
+            log_throttled((endpoint, "TIMEOUT"),
+                          f"  API {endpoint} TIMED OUT after {timeout}s")
             if att < retries:
                 time.sleep(1.5)
         except Exception as e:
-            log.error(f"  API {endpoint} error after {time.time() - t0:.1f}s: {e}")
+            kind = _net_kind(e)
+            if kind == "DNS":
+                msg = (f"  API {endpoint}: cannot resolve api.dhan.co — this machine's "
+                       f"internet / DNS is down")
+            else:
+                msg = f"  API {endpoint} {kind} error after {time.time() - t0:.1f}s: {e}"
+            log_throttled((endpoint, kind), msg)
             if att < retries:
                 time.sleep(1.5)
     return None
@@ -413,7 +439,7 @@ def api_get(endpoint: str, timeout: float = 10):
             reauthenticate(f"HTTP {r.status_code} on {endpoint}")
         _log_api_error(endpoint, r.status_code, r.text or "")
     except Exception as e:
-        log.error(f"  API GET {endpoint}: {e}")
+        log_throttled((endpoint, _net_kind(e)), f"  API GET {endpoint}: {e}")
     return None
 
 

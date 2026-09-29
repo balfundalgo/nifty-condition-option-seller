@@ -27,6 +27,7 @@ from typing import Optional, Dict, Callable, List
 import websocket
 
 from dhan import (IST, NIFTY, CREDS, BASE_DIR, LOG_DIR, now_ist, hhmm, anchor_of,
+                  log_throttled,
                   session_anchor_epoch, epoch_to_ist, init_credentials,
                   fetch_intraday_1m, fetch_expiry_list, pick_expiry,
                   fetch_option_chain, chain_security_id, fetch_lot_size,
@@ -38,7 +39,7 @@ from restfeed import RestCandleFeed, BarSync
 from strategy import (Strategy, StrategyParams, Bundle, Signal, CONDITIONS,
                       CONDITION_NAMES)
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 PERIOD = 5                              # fixed by the strategy
 STATE_FILE = BASE_DIR / "fcos_daily_state.json"
 CONFIG_FILE = BASE_DIR / "fcos_config.json"
@@ -196,6 +197,7 @@ class Engine:
         self.packets = 0
         self._last_loop = time.time()
         self._exit_retry_at = 0.0
+        self._ws_backoff = 2.0
 
     # ─── plumbing ───
 
@@ -530,6 +532,8 @@ class Engine:
 
     def _on_ws_open(self, ws):
         self.ws_connected.set()
+        self._ws_backoff = 2.0
+        log.info("  WebSocket connected")
         try:
             self._subscribe(ws)
         except Exception as e:
@@ -562,11 +566,18 @@ class Engine:
         self._check_exit_on_tick(leg, ltp)
 
     def _on_ws_error(self, ws, error):
-        log.error(f"  WS error: {error}")
+        e = str(error)
+        if "getaddrinfo" in e or "NameResolution" in e:
+            log_throttled(("ws", "DNS"), "  WS: cannot resolve api-feed.dhan.co — "
+                                         "this machine's internet / DNS is down")
+        else:
+            log_throttled(("ws", e[:40]), f"  WS error: {error}")
 
     def _on_ws_close(self, ws, code, msg):
+        was = self.ws_connected.is_set()
         self.ws_connected.clear()
-        log.warning(f"  WS closed: {code} {msg}")
+        if was:
+            log.warning(f"  WS closed: {code} {msg}")
         self._emit("ws", {"connected": False})
 
     def _run_ws(self):
@@ -579,8 +590,13 @@ class Engine:
             except Exception as e:
                 log.error(f"  WS exception: {e}")
             if not self.stop_event.is_set():
-                log.info("  WS reconnecting in 2s...")
-                time.sleep(2)
+                # 2s -> 4 -> 8 -> 16 -> 30s cap while the network is down;
+                # back to 2s as soon as a connection opens.
+                wait = self._ws_backoff
+                self._ws_backoff = min(self._ws_backoff * 2, 30.0)
+                log_throttled(("ws", "retry"), f"  WS reconnecting (next try in {wait:.0f}s)",
+                              level=logging.INFO)
+                self.stop_event.wait(wait)
 
     def _ws_watchdog(self):
         while not self.stop_event.is_set():
@@ -595,7 +611,10 @@ class Engine:
                 continue
             if not (hhmm("09:15") <= now_ist().time() <= hhmm("15:30")):
                 continue
-            if self.last_tick_at and time.time() - self.last_tick_at > self.cfg.ws_silence_seconds:
+            # Only a CONNECTED-but-silent socket needs forcing; a disconnected
+            # one is already retrying in _run_ws with backoff.
+            if (self.ws_connected.is_set() and self.last_tick_at
+                    and time.time() - self.last_tick_at > self.cfg.ws_silence_seconds):
                 log.warning(f"  No websocket tick for {time.time() - self.last_tick_at:.0f}s "
                             f"in market hours — forcing a reconnect")
                 self.last_tick_at = time.time()
@@ -612,6 +631,10 @@ class Engine:
 
     def _monitor(self):
         sq = hhmm(self.cfg.square_off)
+        # The idle detector measures gaps BETWEEN loop passes. Start it now,
+        # not at engine creation — otherwise the pre-open wait (08:23 -> 09:20
+        # on 29-Sep) is reported as the process "not running".
+        self._last_loop = time.time()
         while not self.stop_event.is_set():
             now = time.time()
             gap = now - self._last_loop

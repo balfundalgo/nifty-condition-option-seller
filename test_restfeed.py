@@ -50,6 +50,26 @@ f.poll_leg("SPOT", ("13", "IDX_I", "INDEX"))
 check("09:20 bar emitted", [x[1] for x in out] == [A, A + 300], out)
 
 
+print("Feed: a failed / empty fetch never reports the leg as polled")
+polls = []
+f2 = RestCandleFeed({"SPOT": ("13", "IDX_I", "INDEX")}, fetch_1m=lambda s, g, i: [],
+                    anchor_of=anchor_of, on_bar=lambda leg, b: None,
+                    on_poll=lambda *a: polls.append(a), session_anchor=A,
+                    clock=lambda: A + 3600)
+f2.poll_leg("SPOT", ("13", "IDX_I", "INDEX"))
+check("on_poll not called", polls == [], polls)
+now = [A + 305]
+polls = []
+f3 = RestCandleFeed({"SPOT": ("13", "IDX_I", "INDEX")},
+                    fetch_1m=lambda s, g, i: [m(A + 60 * k, 1, 2, 0.5, 1.5) for k in range(6)],
+                    anchor_of=anchor_of, on_bar=lambda leg, b: polls.append(("bar", b["ts"])),
+                    on_poll=lambda leg, at, last: polls.append(("poll", last)),
+                    session_anchor=A, clock=lambda: now[0])
+f3.poll_leg("SPOT", ("13", "IDX_I", "INDEX"))
+check("bars handed over BEFORE the poll is reported, with last completed minute",
+      polls == [("bar", A), ("poll", A + 240)], polls)
+
+
 print("BarSync: waits for all legs, releases in order")
 now = [A + 310]
 got = []
@@ -63,20 +83,45 @@ bs.add("PE", bar(A))
 check("released when all three arrive", got == [(A, True, True, True)], got)
 bs.add("SPOT", bar(A + 300))
 bs.add("PE", bar(A + 300))
-now[0] = A + 600 + 25
-bs.polled("CE", now[0])
-check("CE missing but polled after close+grace -> released without CE",
+now[0] = A + 3600
+check("time alone never releases a bar", got[-1][0] == A, got)
+bs.polled("CE", now[0], A + 540)          # CE data reaches 09:24 — still inside the 09:20 bar
+check("CE data not yet past the bar -> held", got[-1][0] == A, got)
+bs.polled("CE", now[0], A + 600)          # CE has a completed 09:25 minute, no 09:20 trades
+check("CE data past the bar with no candle there -> released without CE",
       got[-1] == (A + 300, True, False, True), got)
-# each leg is in order (the feed guarantees it) but legs interleave freely
 bs.add("SPOT", bar(A + 600))
 bs.add("SPOT", bar(A + 900))
 bs.add("CE", bar(A + 600))
-check("900 not released ahead of 600", [g[0] for g in got][-1] == A + 300, got)
+check("900 not released ahead of 600", got[-1][0] == A + 300, got)
 bs.add("PE", bar(A + 600))
 bs.add("CE", bar(A + 900))
 bs.add("PE", bar(A + 900))
 check("interleaved legs still released in order, all complete",
       [g[0] for g in got] == [A, A + 300, A + 600, A + 900], [g[0] for g in got])
+
+
+print("29-Sep outage replay: options come back before spot")
+got = []
+bs = BarSync(["SPOT", "CE", "PE"], lambda ts, s, c, p, lag: got.append((ts, bool(s), bool(c), bool(p))),
+             clock=lambda: A + 4 * 3600)
+for leg in ("SPOT", "CE", "PE"):
+    bs.add(leg, bar(A))
+# network down for two hours: no successful polls at all -> nothing to report
+backlog = [A + 300 * k for k in range(1, 24)]
+for ts in backlog:                         # CE and PE recover first and dump their backlog
+    bs.add("CE", bar(ts))
+    bs.polled("CE", 0, ts + 300)
+    bs.add("PE", bar(ts))
+    bs.polled("PE", 0, ts + 300)
+check("nothing released while spot is still missing", [g[0] for g in got] == [A], got[-3:])
+for ts in backlog:                         # spot recovers
+    bs.add("SPOT", bar(ts))
+bs.polled("SPOT", 0, backlog[-1] + 300)
+check("whole backlog released, in order, every bar WITH spot",
+      [g[0] for g in got] == [A] + backlog and all(g[1] and g[2] and g[3] for g in got),
+      got[:3])
+check("no spot candle dropped as late", bs.late_dropped == 0, bs.late_dropped)
 
 print()
 if FAILS:
