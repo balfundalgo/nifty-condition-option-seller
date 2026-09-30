@@ -12,26 +12,29 @@ Ranges
   R2  = 09:20 candle (second)  on spot, CE, PE   — Manipulation only
 
 Breaks
-  option "breaks high/low"  : wick (bar high > range high / bar low < range low)
-  spot "breaks high/low"    : wick
-  spot "stays inside"       : checked at candle CLOSE
-  spot "closes beyond"      : close
+  "breaks high/low"         : wick (bar high > range high / bar low < range low)
+  "stays in range"          : the WHOLE candle, wicks included, inside the range
+                              (high <= range high and low >= range low) — for
+                              spot and for options alike. Once an instrument
+                              wicks out, "stays in range" has failed for the day.
+  spot "closes beyond"      : close (the triggers of Conditions 1, 2, Manipulation)
 
 Common to every condition
   entry   SELL the option at the close of the reversal candle
   SL      sold option premium: max(high of reversal candle, high of the candle
           before it) + sl_buffer
   target  a SPOT level, fixed at the moment of entry
-  one trade per day — the first condition to fire locks all the others
+  every condition trades independently: several may fire on the same candle
+  or while others are in trade; each condition SIDE trades at most once a day
 
-Condition 1  (R1) spot closes inside; both options break, opposite sides
+Condition 1  (R1) spot fully inside; both options break, opposite sides
   PE broke high + CE broke low  -> spot close < spot low -> bullish reversal
                                    (spot) -> SELL PE, target spot day high
   CE broke high + PE broke low  -> spot close > spot high -> bearish reversal
                                    (spot) -> SELL CE, target spot day low
 
 Condition 2  (R1) decided on the first bar where spot breaks a side
-  spot breaks high, CE broke high, PE untouched
+  spot breaks high, CE broke high, PE untouched (fully inside its range)
      new high = high of that spot bar -> spot close > new high
      -> bearish reversal (spot) -> SELL CE, target first-candle open
   mirror: spot breaks low, PE broke high, CE untouched -> SELL PE
@@ -42,13 +45,14 @@ Condition 3  (R1) decided on the first bar where spot breaks a side
   mirror: spot breaks low -> PE breaks its high -> bearish reversal (PE)
      -> SELL PE, target day high
 
-Condition 5  (R1) spot closes inside; one option breaks high, other untouched
+Condition 5  (R1) spot fully inside; one option breaks high, other untouched
   CE broke high, PE untouched -> bearish reversal (CE), peak 1 = CE high of
      that swing -> CE breaks peak 1 -> second bearish reversal (CE)
      -> SELL CE, target day low
   mirror on PE -> SELL PE, target day high
 
-Manipulation  (R2) Condition 1 on the second candle, with a close filter
+Manipulation  (R2) Condition 1 on the second candle (spot fully inside R2),
+              with a close filter
   PE broke R2 high + CE broke R2 low -> spot close <= R2 spot low - manip_points
      -> bullish reversal (spot) -> SELL PE, target day high
   mirror -> spot close >= R2 spot high + manip_points -> SELL CE, target day low
@@ -150,7 +154,6 @@ class BreakTracker:
         self.r = rng
         self.hi = {"CE": False, "PE": False, "SPOT": False}
         self.lo = {"CE": False, "PE": False, "SPOT": False}
-        self.spot_closed_outside = False       # before the current bar
         self.first_spot_hi_idx: Optional[int] = None
         self.first_spot_lo_idx: Optional[int] = None
 
@@ -168,11 +171,11 @@ class BreakTracker:
                 self.lo[leg] = True
 
     def untouched(self, leg: str) -> bool:
+        """
+        The leg has stayed in range — every candle so far, wicks included,
+        inside the range (includes the current candle).
+        """
         return not self.hi[leg] and not self.lo[leg]
-
-    def spot_close_inside(self, spot: dict) -> bool:
-        r = self.r["SPOT"]
-        return r.low <= spot["close"] <= r.high
 
 
 def _other(side: str) -> str:
@@ -246,7 +249,7 @@ class SplitMachine(Machine):
     """
     Condition 1 (R1) and Manipulation (R2).
 
-    side PE: PE broke high + CE broke low while spot closes inside
+    side PE: PE broke high + CE broke low while spot stays fully inside
              -> spot close below low (minus filter) -> bullish spot reversal
     side CE: mirror.
     """
@@ -266,18 +269,15 @@ class SplitMachine(Machine):
         opp = _other(self.side)
 
         if self.state == "WAIT_SETUP":
-            if bt.spot_closed_outside:
-                self.dead("spot closed outside the range before both options split")
+            if not bt.untouched("SPOT"):
+                self.dead("spot wicked outside the range before both options split")
                 return None
             if bt.hi[self.side] and bt.lo[opp]:
-                if bt.spot_close_inside(spot):
-                    self.state = "WAIT_TRIGGER"
-                    self.note = (f"{self.side} broke high, {opp} broke low, spot inside "
-                                 f"— waiting for spot close "
-                                 f"{'below' if self.side == 'PE' else 'above'} "
-                                 f"{(r.low - self.filter) if self.side == 'PE' else (r.high + self.filter):.2f}")
-                else:
-                    self.dead("options split on the same candle spot closed outside")
+                self.state = "WAIT_TRIGGER"
+                self.note = (f"{self.side} broke high, {opp} broke low, spot fully inside "
+                             f"— waiting for spot close "
+                             f"{'below' if self.side == 'PE' else 'above'} "
+                             f"{(r.low - self.filter) if self.side == 'PE' else (r.high + self.filter):.2f}")
             return None
 
         if self.state == "WAIT_TRIGGER":
@@ -403,7 +403,7 @@ class DoubleTopMachine(Machine):
     """
     Condition 5.
 
-    side CE: spot closes inside; CE broke high; PE untouched
+    side CE: spot fully inside; CE broke high; PE fully inside
              -> bearish CE reversal #1, peak 1 = CE high of that swing
              -> CE breaks peak 1 -> bearish CE reversal #2 -> SELL CE, day low
     side PE: mirror on PE -> SELL PE, day high
@@ -420,20 +420,18 @@ class DoubleTopMachine(Machine):
         opp = _other(self.side)
 
         if self.state == "WAIT_SETUP":
-            if bt.spot_closed_outside:
-                self.dead("spot closed outside the range first")
+            if not bt.untouched("SPOT"):
+                self.dead("spot wicked outside the range before the setup formed")
+                return None
+            if not bt.untouched(opp):
+                self.dead(f"{opp} left its range before the setup formed")
                 return None
             if bt.hi[self.side]:
-                if bt.untouched(opp) and bt.spot_close_inside(ctx.spot[i]):
-                    self.trigger_idx = i
-                    self.swing_start = i
-                    self.state = "WAIT_REV1"
-                    self.note = (f"{self.side} broke high, {opp} held, spot inside "
-                                 f"— waiting for first bearish reversal on {self.side}")
-                else:
-                    self.dead(f"{self.side} broke high but {opp} was not untouched "
-                              f"or spot closed outside")
-                    return None
+                self.trigger_idx = i
+                self.swing_start = i
+                self.state = "WAIT_REV1"
+                self.note = (f"{self.side} broke high, {opp} and spot fully inside "
+                             f"— waiting for first bearish reversal on {self.side}")
             else:
                 return None
 
@@ -472,8 +470,6 @@ class Strategy:
         self.ctx = Ctx()
         self.bt1: Optional[BreakTracker] = None
         self.bt2: Optional[BreakTracker] = None
-        self.locked = False
-        self.fired: Optional[Signal] = None
         self.machines: List[Machine] = []
         for side in ("CE", "PE"):
             self.machines += [
@@ -488,33 +484,36 @@ class Strategy:
             if not self.params.enabled.get(m.cond, True):
                 m.dead("disabled in settings")
 
-    def lock(self, why: str = "trade taken"):
-        self.locked = True
-        for m in self.machines:
-            if m.state not in ("DEAD", "FIRED", "LOCKED"):
-                m._prelock = (m.state, m.note)
-                m.state = "LOCKED"
+    def machine(self, key: str) -> Optional[Machine]:
+        return next((m for m in self.machines if m.key == key), None)
+
+    def mark_done(self, keys, why: str = "already traded today"):
+        """Restart safety: condition sides that already traded today never fire again."""
+        for k in keys:
+            m = self.machine(k)
+            if m and m.state not in ("DEAD",):
+                m.state = "FIRED"
                 m.note = why
 
     def release(self, sig: Signal, why: str):
         """
         A signal fired but the engine declined to trade it (target already
-        met, stop already through). That machine is finished for the day;
-        every other machine resumes exactly where it was.
+        met, stop already through). Only that condition side is finished for
+        the day; every other machine is untouched.
         """
-        self.locked = False
-        self.fired = None
-        for m in self.machines:
-            if m.cond == sig.condition and m.side == sig.side:
-                m.dead(f"signal skipped — {why}")
-            elif m.state == "LOCKED" and hasattr(m, "_prelock"):
-                m.state, m.note = m._prelock
+        m = self.machine(f"{sig.condition}-{sig.side}")
+        if m:
+            m.dead(f"signal skipped — {why}")
 
-    def on_bundle(self, b: Bundle, can_enter: bool = True) -> Optional[Signal]:
-        """Process one synchronised candle. Returns a Signal at most once per day."""
+    def on_bundle(self, b: Bundle, can_enter: bool = True) -> List[Signal]:
+        """
+        Process one synchronised candle. Returns every signal fired on it —
+        conditions are independent, and each condition side fires at most once
+        a day.
+        """
         ctx = self.ctx
         if not b.spot:
-            return None
+            return []
         ctx.spot.append(b.spot)
         ctx.ce.append(b.ce)
         ctx.pe.append(b.pe)
@@ -526,9 +525,9 @@ class Strategy:
             ctx.r1 = {"SPOT": Rng.of(b.spot), "CE": Rng.of(b.ce), "PE": Rng.of(b.pe)}
             if all(ctx.r1.values()):
                 self.bt1 = BreakTracker(ctx.r1)
-            return None
+            return []
 
-        # R1 trackers see every bar after the first candle
+        # R1 trackers see every bar after the first candle (wick breaks, cumulative)
         if self.bt1:
             self.bt1.update(i, b.spot, b.ce, b.pe)
 
@@ -539,29 +538,18 @@ class Strategy:
         elif self.bt2:
             self.bt2.update(i, b.spot, b.ce, b.pe)
 
-        sig = None
-        if not self.locked:
-            for m in self.machines:
-                if m.state in ("DEAD", "LOCKED", "FIRED"):
-                    continue
-                if m.cond == "MANIP" and i < 2:
-                    continue
-                s = m.step(can_enter)
-                if s and sig is None:
-                    sig = s
-                    m.state = "FIRED"
-                    m.note = f"FIRED — sell {s.side} ({s.pattern})"
-
-        # "stays inside, checked at candle close" — record AFTER the machines
-        # have seen this bar, so a machine arming on this bar sees it inside.
-        for bt in (self.bt1, self.bt2 if i >= 2 else None):
-            if bt and not bt.spot_close_inside(b.spot):
-                bt.spot_closed_outside = True
-
-        if sig:
-            self.fired = sig
-            self.lock(f"locked — {CONDITION_NAMES[sig.condition]} {sig.side} fired")
-        return sig
+        sigs: List[Signal] = []
+        for m in self.machines:
+            if m.state in ("DEAD", "FIRED"):
+                continue
+            if m.cond == "MANIP" and i < 2:
+                continue
+            s = m.step(can_enter)
+            if s:
+                m.state = "FIRED"
+                m.note = f"FIRED — sell {s.side} ({s.pattern})"
+                sigs.append(s)
+        return sigs
 
     def snapshot(self) -> dict:
         return {
@@ -570,5 +558,4 @@ class Strategy:
             "bars": len(self.ctx.spot),
             "machines": [{"key": m.key, "cond": m.cond, "side": m.side,
                           "state": m.state, "note": m.note} for m in self.machines],
-            "locked": self.locked,
         }

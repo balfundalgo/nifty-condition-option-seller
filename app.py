@@ -31,11 +31,11 @@ FL = ("Segoe UI", 11); FB = ("Segoe UI", 20, "bold"); FX = ("Consolas", 11)
 
 STATE_COLOURS = {"WAIT_SETUP": DIM, "WAIT_TRIGGER": AMB, "WAIT_REVERSAL": ACC,
                  "WAIT_REV1": AMB, "WAIT_BREAK2": AMB, "WAIT_REV2": ACC,
-                 "FIRED": GRN, "DEAD": BD, "LOCKED": DIM}
+                 "FIRED": GRN, "DEAD": BD}
 STATE_LABELS = {"WAIT_SETUP": "waiting for setup", "WAIT_TRIGGER": "armed — waiting trigger",
                 "WAIT_REVERSAL": "waiting reversal", "WAIT_REV1": "waiting reversal #1",
                 "WAIT_BREAK2": "waiting break of peak 1", "WAIT_REV2": "waiting reversal #2",
-                "FIRED": "FIRED", "DEAD": "not today", "LOCKED": "locked"}
+                "FIRED": "TRADED today", "DEAD": "not today"}
 
 
 class QueueHandler(logging.Handler):
@@ -203,12 +203,15 @@ class App(ctk.CTk):
 
         pf = ctk.CTkFrame(mid, fg_color=CARD, corner_radius=8)
         pf.pack(side="left", fill="both", expand=True, padx=4)
-        ctk.CTkLabel(pf, text="Position", font=FH, text_color=TXT).pack(anchor="w", padx=10, pady=4)
-        self.pos_lbl = ctk.CTkLabel(pf, text="Flat", font=("Segoe UI", 14), text_color=DIM,
-                                    justify="left", anchor="w")
-        self.pos_lbl.pack(anchor="w", padx=12)
-        self.pnl_lbl = ctk.CTkLabel(pf, text="", font=FB, text_color=TXT)
-        self.pnl_lbl.pack(anchor="w", padx=12, pady=6)
+        hdr = ctk.CTkFrame(pf, fg_color=CARD)
+        hdr.pack(fill="x", padx=10, pady=4)
+        ctk.CTkLabel(hdr, text="Positions", font=FH, text_color=TXT).pack(side="left")
+        self.pnl_lbl = ctk.CTkLabel(hdr, text="", font=FH, text_color=TXT)
+        self.pnl_lbl.pack(side="right")
+        self.pos_box = ctk.CTkTextbox(pf, height=150, font=FX)
+        self.pos_box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.pos_box.insert("end", "No trades yet today.")
+        self.pos_box.configure(state="disabled")
 
         cf = ctk.CTkFrame(p, fg_color=CARD, corner_radius=8)
         cf.pack(fill="x", padx=4, pady=6)
@@ -346,22 +349,25 @@ class App(ctk.CTk):
 
     def _stop(self):
         if self.engine:
-            if self.engine.position and not messagebox.askyesno(
-                    "Stop", "A position is OPEN. Stopping does NOT square it off.\n\n"
-                            "Stop anyway?"):
+            n = len(self.engine.positions)
+            if n and not messagebox.askyesno(
+                    "Stop", f"{n} position(s) OPEN. Stopping does NOT square them off.\n\n"
+                            f"Stop anyway?"):
                 return
             self.engine.stop()
 
     def _square_off(self):
-        if self.engine and self.engine.position:
-            if messagebox.askyesno("Square off", "Buy back the open position now?"):
+        n = len(self.engine.positions) if self.engine else 0
+        if n:
+            if messagebox.askyesno("Square off", f"Buy back ALL {n} open position(s) now?"):
                 self.engine.manual_square_off()
         else:
-            self._log("No open position")
+            self._log("No open positions")
 
     def _on_close(self):
-        if self.engine and self.engine.position and not messagebox.askyesno(
-                "Exit", "A position is OPEN and will NOT be squared off.\n\nExit anyway?"):
+        if self.engine and self.engine.positions and not messagebox.askyesno(
+                "Exit", f"{len(self.engine.positions)} position(s) OPEN and will NOT be "
+                        f"squared off.\n\nExit anyway?"):
             return
         if self.engine:
             self.engine.stop()
@@ -410,7 +416,7 @@ class App(ctk.CTk):
             self._show_tick(d)
         elif ev == "trade_closed":
             pts = d["entry"] - d["exit"]
-            self._log(f"TRADE CLOSED {d['side']} {d['reason']}  {pts:+.2f} pts  "
+            self._log(f"TRADE CLOSED {d['key']} {d['reason']}  {pts:+.2f} pts  "
                       f"{pts * d['qty']:+,.2f}")
         elif ev == "engine_done":
             self.start_btn.configure(state="normal")
@@ -451,23 +457,35 @@ class App(ctk.CTk):
             text=f"WS {'on' if d['ws'] else 'off'} · lag {lag:.1f}s" if lag is not None
             else f"WS {'on' if d['ws'] else 'off'}",
             text_color=GRN if d["ws"] else RED)
-        p = d.get("position")
-        if p:
-            self.pos_lbl.configure(
-                text=f"SHORT {p['side']} {p['strike']:.0f}  x{p['qty']}  "
-                     f"({CONDITION_NAMES[p['condition']]}, {p['pattern']})\n"
-                     f"Entry {p['entry']:.2f} at {p['entry_time']}   ·   "
-                     f"SL {p['sl']:.2f} (option)   ·   "
-                     f"Target {p['target']:.2f} (spot {p['target_kind'].replace('_', ' ')})\n"
-                     f"Status {p['status']}", text_color=TXT)
-            u = d["upnl"]
-            self.pnl_lbl.configure(text=f"{u:+,.2f}", text_color=GRN if u >= 0 else RED)
+        rows = d.get("positions", [])
+        lines = []
+        if rows:
+            lines.append(f"{'COND':<9}{'SIDE':<5}{'STRIKE':>7}{'QTY':>6}{'ENTRY':>9}"
+                         f"{'SL':>9}{'TARGET':>10}{'LTP':>9}{'P&L':>11}  STATUS")
+            for r in rows:
+                st = r["status"] if r["status"] != "CLOSED" else f"{r['reason']} {r['exit_time']}"
+                lines.append(f"{r['key']:<9}{r['side']:<5}{r['strike']:>7.0f}{r['qty']:>6}"
+                             f"{r['entry']:>9.2f}{r['sl']:>9.2f}{r['target']:>10.2f}"
+                             f"{r['ltp']:>9.2f}{r['pnl']:>+11,.0f}  {st}")
         else:
-            r = d.get("realised", 0.0)
-            self.pos_lbl.configure(text="Flat" + ("  ·  traded today" if d.get("traded_today") else ""),
-                                   text_color=DIM)
-            self.pnl_lbl.configure(text=f"Day {r:+,.2f}" if d.get("traded_today") else "",
-                                   text_color=GRN if r >= 0 else RED)
+            lines.append("No trades yet today.")
+        if d.get("halted"):
+            lines.append("")
+            lines.append("NEW ENTRIES HALTED (a live entry failed) — open positions still managed")
+        text = "\n".join(lines)
+        if text != getattr(self, "_pos_text", None):
+            self._pos_text = text
+            self.pos_box.configure(state="normal")
+            self.pos_box.delete("1.0", "end")
+            self.pos_box.insert("end", text)
+            self.pos_box.configure(state="disabled")
+        total = d.get("upnl", 0.0) + d.get("realised", 0.0)
+        if rows:
+            self.pnl_lbl.configure(
+                text=f"open {d.get('open', 0)}  ·  day {total:+,.2f}",
+                text_color=GRN if total >= 0 else RED)
+        else:
+            self.pnl_lbl.configure(text="")
 
 
 def main():

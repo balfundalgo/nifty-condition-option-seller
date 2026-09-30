@@ -14,7 +14,9 @@ Day flow
                  WebSocket: LTP for spot, CE, PE -> SL, target, fills
   entry          SELL at the close of the reversal candle (09:25 - 14:30)
   exit           SL on sold option LTP | target on spot LTP | 15:15 square-off
-  one trade per day
+  trades         every condition trades independently, each with its own
+                 position, SL and target; each condition SIDE (e.g. C1-PE)
+                 trades at most once a day
 
 Balfund Trading Pvt Ltd | www.balfund.com
 """
@@ -39,7 +41,7 @@ from restfeed import RestCandleFeed, BarSync
 from strategy import (Strategy, StrategyParams, Bundle, Signal, CONDITIONS,
                       CONDITION_NAMES)
 
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 PERIOD = 5                              # fixed by the strategy
 STATE_FILE = BASE_DIR / "fcos_daily_state.json"
 CONFIG_FILE = BASE_DIR / "fcos_config.json"
@@ -146,6 +148,7 @@ CANDLES = CsvLog(_candle_csv, ["time", "lag", "spot_o", "spot_h", "spot_l", "spo
 
 @dataclass
 class Position:
+    key: str                            # condition side, e.g. "C1-PE"
     condition: str
     side: str
     security_id: str
@@ -162,6 +165,17 @@ class Position:
     exit: float = 0.0
     exit_time: str = ""
     reason: str = ""
+    retry_at: float = 0.0
+
+
+_POS_FIELDS = set(Position.__dataclass_fields__)
+
+
+def position_from(d: dict) -> Position:
+    """Rebuild a Position from saved state; tolerates files written by v1.0.x."""
+    d = dict(d)
+    d.setdefault("key", f"{d.get('condition')}-{d.get('side')}")
+    return Position(**{k: v for k, v in d.items() if k in _POS_FIELDS})
 
 
 class Engine:
@@ -183,10 +197,10 @@ class Engine:
         self.tick_high = 0.0
         self.tick_low = 0.0
 
-        self.position: Optional[Position] = None
+        self.positions: Dict[str, Position] = {}      # open, by condition side
         self.closed: List[Position] = []
-        self.traded_today = False
-        self.halted = False
+        self.traded_keys: set = set()                 # condition sides traded today
+        self.halted = False                           # no NEW entries (failed live entry)
         self.status = "IDLE"
 
         self.feed: Optional[RestCandleFeed] = None
@@ -196,7 +210,6 @@ class Engine:
         self.last_tick_at = 0.0
         self.packets = 0
         self._last_loop = time.time()
-        self._exit_retry_at = 0.0
         self._ws_backoff = 2.0
 
     # ─── plumbing ───
@@ -217,8 +230,8 @@ class Engine:
     def _save_state(self):
         d = {"date": now_ist().strftime("%Y-%m-%d"), "expiry": self.expiry,
              "atm": self.atm, "strikes": self.strikes, "sec": self.sec,
-             "traded_today": self.traded_today,
-             "position": asdict(self.position) if self.position else None,
+             "traded_keys": sorted(self.traded_keys), "halted": self.halted,
+             "positions": [asdict(p) for p in self.positions.values()],
              "closed": [asdict(p) for p in self.closed]}
         try:
             STATE_FILE.write_text(json.dumps(d, indent=2))
@@ -263,16 +276,30 @@ class Engine:
 
         st = self._load_state()
         if st:
-            self.traded_today = bool(st.get("traded_today"))
-            self.closed = [Position(**p) for p in st.get("closed", [])]
-            if st.get("position") and st["position"].get("status") != "CLOSED":
-                self.position = Position(**st["position"])
-                log.warning(f"  RESUMING open position from earlier today: "
-                            f"SHORT {self.position.side} {self.position.strike:.0f} "
-                            f"x{self.position.qty} @ {self.position.entry:.2f}  "
-                            f"SL {self.position.sl:.2f}  target {self.position.target:.2f}")
-            if self.traded_today:
-                log.info("  A trade was already taken today — no new entries.")
+            self.traded_keys = set(st.get("traded_keys", []))
+            self.halted = bool(st.get("halted"))
+            self.closed = [position_from(p) for p in st.get("closed", [])]
+            saved = list(st.get("positions", []))
+            if st.get("position"):                    # v1.0.x single-position file
+                saved.append(st["position"])
+                self.traded_keys.add(f"{st['position'].get('condition')}-"
+                                     f"{st['position'].get('side')}")
+            for d in saved:
+                p = position_from(d)
+                if p.status == "CLOSED":
+                    continue
+                if p.status == "EXITING":
+                    p.status = "EXIT_FAILED"          # an exit was in flight — retry it
+                self.positions[p.key] = p
+                log.warning(f"  RESUMING open position {p.key}: SHORT {p.side} "
+                            f"{p.strike:.0f} x{p.qty} @ {p.entry:.2f}  SL {p.sl:.2f}  "
+                            f"target {p.target:.2f}")
+            if self.traded_keys:
+                log.info(f"  Already traded today (will not fire again): "
+                         f"{', '.join(sorted(self.traded_keys))}")
+            if self.halted:
+                log.warning("  New entries are HALTED for today (a live entry failed "
+                            "earlier). Open positions are still managed.")
         return True
 
     def _wait_for_first_candle(self) -> Optional[float]:
@@ -363,8 +390,7 @@ class Engine:
     def _on_bundle(self, ts, spot, ce, pe, lag):
         with self._lock:
             fresh = lag <= self.cfg.max_signal_age
-            can_enter = (fresh and self._entry_window(ts) and not self.traded_today
-                         and not self.halted and self.position is None)
+            can_enter = fresh and self._entry_window(ts) and not self.halted
             hm = epoch_to_ist(ts)
             CANDLES.row(time=hm, lag=f"{lag:.1f}",
                         **{f"{k}_{f[0]}": (b or {}).get(f, "")
@@ -375,7 +401,7 @@ class Engine:
             if not fresh and waiting and self._entry_window(ts):
                 log.info(f"  {hm} candle arrived {lag:.0f}s late — state updated, "
                          f"entries not allowed on it")
-            sig = self.strategy.on_bundle(Bundle(ts, spot, ce, pe, lag), can_enter)
+            sigs = self.strategy.on_bundle(Bundle(ts, spot, ce, pe, lag), can_enter)
             self._emit("candle", {"time": hm, "lag": lag, "spot": spot, "ce": ce, "pe": pe})
             self._emit("strategy", self.strategy.snapshot())
             if len(self.strategy.ctx.spot) == 1:
@@ -385,7 +411,11 @@ class Engine:
                 log.info(f"  R2 (09:20)  spot {spot['high']:.2f}/{spot['low']:.2f}  "
                          f"CE {self._hl(ce)}  PE {self._hl(pe)}")
             self._log_transitions()
-            if sig:
+            for sig in sigs:
+                if self.halted:
+                    log.warning(f"  {sig.condition}-{sig.side} fired but entries are "
+                                f"halted — not traded")
+                    break
                 self._enter(sig)
 
     @staticmethod
@@ -399,12 +429,15 @@ class Engine:
             k = (m.state, m.note)
             if self._seen.get(m.key) != k:
                 self._seen[m.key] = k
-                if m.state not in ("WAIT_SETUP", "LOCKED") and m.note:
+                if m.state != "WAIT_SETUP" and m.note:
                     log.info(f"  [{CONDITION_NAMES[m.cond]} {m.side}] {m.state}: {m.note}")
 
     # ─── entry / exit ───
 
     def _enter(self, sig: Signal):
+        key = f"{sig.condition}-{sig.side}"
+        if key in self.traded_keys:
+            return                                  # once per day per condition side
         side = sig.side
         spot = self.ltp["SPOT"] or sig.spot_close
         opt_ltp = self.ltp[side] or sig.option_close
@@ -427,68 +460,75 @@ class Engine:
         elif opt_ltp >= sig.sl:
             why = f"{side} LTP {opt_ltp:.2f} already at/above SL {sig.sl:.2f}"
         if why:
-            log.warning(f"  Signal NOT traded — {why}. Other conditions stay live.")
+            log.warning(f"  {key} NOT traded — {why}. Other conditions carry on.")
             self.strategy.release(sig, why)
             self._emit("strategy", self.strategy.snapshot())
             return
 
         qty = self.lot_size * max(1, int(self.cfg.lots))
         sec = self.sec[side]
+        self.traded_keys.add(key)
         if self.cfg.mode == "live":
             r = place_order_limit_ioc(sec, NIFTY["segment"], "SELL", qty, opt_ltp)
             if not r.get("filled"):
-                log.error("  ENTRY ORDER NOT FILLED — halting for the day. "
-                          "Check the broker terminal for any partial position.")
+                log.error(f"  {key} ENTRY ORDER NOT FILLED — no new entries for the rest "
+                          f"of the day. Open positions are still managed. Check the broker "
+                          f"terminal for any partial position.")
                 self.halted = True
-                self.traded_today = True
                 self._save_state()
-                self._set_status("ENTRY FAILED")
+                self._set_status("ENTRY FAILED — ENTRIES HALTED")
                 return
             fill, oid = float(r["price"]), r.get("order_id", "")
         else:
             fill, oid = opt_ltp, "PAPER"
 
-        self.position = Position(condition=sig.condition, side=side, security_id=sec,
-                                 strike=self.strikes[side], qty=qty, entry=fill,
-                                 sl=sig.sl, target=round(target, 2),
-                                 target_kind=sig.target_kind, pattern=sig.pattern,
-                                 entry_time=now_ist().strftime("%H:%M:%S"), order_id=oid)
-        self.traded_today = True
+        p = Position(key=key, condition=sig.condition, side=side, security_id=sec,
+                     strike=self.strikes[side], qty=qty, entry=fill, sl=sig.sl,
+                     target=round(target, 2), target_kind=sig.target_kind,
+                     pattern=sig.pattern, entry_time=now_ist().strftime("%H:%M:%S"),
+                     order_id=oid)
+        self.positions[key] = p
         self._save_state()
-        log.info(f"  ENTERED SHORT {side} {self.strikes[side]:.0f} x{qty} @ {fill:.2f} "
-                 f"[{self.cfg.mode}]  SL {sig.sl:.2f}  target spot {target:.2f}")
+        log.info(f"  ENTERED {key}: SHORT {side} {self.strikes[side]:.0f} x{qty} @ {fill:.2f} "
+                 f"[{self.cfg.mode}]  SL {sig.sl:.2f}  target spot {target:.2f}  "
+                 f"({len(self.positions)} open)")
         self._set_status("IN TRADE")
-        self._emit("position", asdict(self.position))
+        self._emit("position", asdict(p))
 
     def _check_exit_on_tick(self, leg: str, ltp: float):
-        p = self.position
-        if not p or p.status != "OPEN":
-            return
-        if leg == p.side and ltp >= p.sl:
-            self._exit(f"SL ({p.side} {ltp:.2f} >= {p.sl:.2f})", "SL")
-        elif leg == "SPOT":
-            if (p.side == "CE" and ltp <= p.target) or (p.side == "PE" and ltp >= p.target):
-                self._exit(f"TARGET (spot {ltp:.2f} reached {p.target:.2f})", "TARGET")
+        for p in list(self.positions.values()):
+            if p.status != "OPEN":
+                continue
+            if leg == p.side and ltp >= p.sl:
+                self._exit(p.key, f"SL ({p.side} {ltp:.2f} >= {p.sl:.2f})", "SL")
+            elif leg == "SPOT":
+                if (p.side == "CE" and ltp <= p.target) or (p.side == "PE" and ltp >= p.target):
+                    self._exit(p.key, f"TARGET (spot {ltp:.2f} reached {p.target:.2f})",
+                               "TARGET")
 
-    def _exit(self, why: str, reason: str):
+    def _exit(self, key: str, why: str, reason: str):
         with self._lock:
-            p = self.position
+            p = self.positions.get(key)
             if not p or p.status not in ("OPEN", "EXIT_FAILED"):
                 return
             p.status = "EXITING"
-        threading.Thread(target=self._do_exit, args=(why, reason), daemon=True).start()
+        threading.Thread(target=self._do_exit, args=(key, why, reason), daemon=True).start()
 
-    def _do_exit(self, why: str, reason: str):
-        p = self.position
-        log.info(f"  EXIT — {why}")
+    def _do_exit(self, key: str, why: str, reason: str):
+        p = self.positions.get(key)
+        if not p:
+            return
+        log.info(f"  EXIT {key} — {why}")
         ltp = self.ltp[p.side] or p.entry
         if self.cfg.mode == "live":
             r = place_order_limit_ioc(p.security_id, NIFTY["segment"], "BUY", p.qty, ltp)
             if not r.get("filled"):
                 with self._lock:
                     p.status = "EXIT_FAILED"
-                    self._exit_retry_at = time.time() + 5
-                log.error("  EXIT ORDER NOT FILLED — retrying in 5s. Watch the terminal.")
+                    p.retry_at = time.time() + 5
+                    if not p.reason:
+                        p.reason = reason
+                log.error(f"  {key} EXIT ORDER NOT FILLED — retrying in 5s. Watch the terminal.")
                 self._set_status("EXIT FAILED — RETRYING")
                 self._save_state()
                 return
@@ -507,17 +547,19 @@ class Engine:
                        target=f"{p.target:.2f}", pattern=p.pattern, exit_time=p.exit_time,
                        exit=f"{p.exit:.2f}", reason=reason, pnl_points=f"{pts:.2f}",
                        pnl_value=f"{pts * p.qty:.2f}")
+            self.positions.pop(key, None)
             self.closed.append(p)
-            self.position = None
             self._save_state()
-        log.info(f"  CLOSED {p.side} @ {fill:.2f}  {reason}  P&L {pts:+.2f} pts "
-                 f"= {pts * p.qty:+,.2f}")
+        log.info(f"  CLOSED {key} @ {fill:.2f}  {reason}  P&L {pts:+.2f} pts "
+                 f"= {pts * p.qty:+,.2f}  ({len(self.positions)} still open)")
         self._emit("trade_closed", asdict(p))
-        self._set_status("DONE FOR THE DAY")
+        self._set_status("IN TRADE" if self.positions else "RUNNING")
 
     def manual_square_off(self):
-        if self.position and self.position.status in ("OPEN", "EXIT_FAILED"):
-            self._exit("manual square-off", "MANUAL")
+        """Buy back every open position now."""
+        for key, p in list(self.positions.items()):
+            if p.status in ("OPEN", "EXIT_FAILED"):
+                self._exit(key, "manual square-off", "MANUAL")
 
     # ─── websocket ───
 
@@ -645,28 +687,33 @@ class Engine:
             self._last_loop = now
             if self.sync:
                 self.sync.pump()
-            p = self.position
-            if p:
+            for key, p in list(self.positions.items()):
                 if now_ist().time() >= sq and p.status == "OPEN":
-                    self._exit(f"square-off {self.cfg.square_off}", "SQUARE_OFF")
-                elif p.status == "EXIT_FAILED" and now >= self._exit_retry_at:
-                    self._exit("retrying failed exit", p.reason or "RETRY")
+                    self._exit(key, f"square-off {self.cfg.square_off}", "SQUARE_OFF")
+                elif p.status == "EXIT_FAILED" and now >= p.retry_at:
+                    self._exit(key, "retrying failed exit", p.reason or "RETRY")
             self._emit("tick", self.summary())
             self.stop_event.wait(1.0)
 
     def summary(self) -> dict:
-        p = self.position
+        rows = []
         upnl = 0.0
-        if p and self.ltp.get(p.side):
-            upnl = (p.entry - self.ltp[p.side]) * p.qty
+        for p in self.positions.values():
+            ltp = self.ltp.get(p.side) or 0.0
+            u = (p.entry - ltp) * p.qty if ltp else 0.0
+            upnl += u
+            rows.append(dict(asdict(p), ltp=ltp, pnl=u))
         realised = sum((c.entry - c.exit) * c.qty for c in self.closed)
+        for c in self.closed:
+            rows.append(dict(asdict(c), ltp=c.exit, pnl=(c.entry - c.exit) * c.qty))
         h = self.feed.health() if self.feed else {}
         return {"status": self.status, "mode": self.cfg.mode, "ltp": dict(self.ltp),
                 "day_high": self.tick_high, "day_low": self.tick_low,
-                "position": asdict(p) if p else None, "upnl": upnl, "realised": realised,
+                "positions": rows, "open": len(self.positions),
+                "upnl": upnl, "realised": realised,
                 "ws": self.ws_connected.is_set(), "packets": self.packets,
                 "avg_lag": h.get("avg_lag"), "max_lag": h.get("max_lag"),
-                "traded_today": self.traded_today}
+                "traded": sorted(self.traded_keys), "halted": self.halted}
 
     def run(self):
         if not self.initialize():
@@ -679,17 +726,17 @@ class Engine:
             self._set_status("SETUP FAILED")
             return
 
-        if self.traded_today:
-            self.strategy.lock("a trade was already taken today")
+        if self.traded_keys:
+            self.strategy.mark_done(self.traded_keys)
 
-        if self.position and self.cfg.mode == "live":
-            held = [x for x in get_positions()
-                    if str(x.get("securityId")) == self.position.security_id]
-            if not held:
-                log.warning("  Resumed position is NOT open at the broker — dropping it "
-                            "from state. Verify in the terminal.")
-                self.position = None
-                self._save_state()
+        if self.positions and self.cfg.mode == "live":
+            held = {str(x.get("securityId")) for x in get_positions()}
+            for key, p in list(self.positions.items()):
+                if p.security_id not in held:
+                    log.warning(f"  Resumed position {key} is NOT open at the broker — "
+                                f"dropping it from state. Verify in the terminal.")
+                    self.positions.pop(key)
+            self._save_state()
 
         threading.Thread(target=self._run_ws, daemon=True, name="ws").start()
         threading.Thread(target=self._ws_watchdog, daemon=True, name="ws-watchdog").start()
@@ -705,8 +752,7 @@ class Engine:
                                    on_poll=self.sync.polled,
                                    on_blind=lambda q: self._set_status("NO DATA"))
         self.feed.start()
-        self._set_status("IN TRADE" if self.position else
-                         ("DONE FOR THE DAY" if self.traded_today else "RUNNING"))
+        self._set_status("IN TRADE" if self.positions else "RUNNING")
         self._monitor()
 
     def stop(self):
@@ -714,9 +760,10 @@ class Engine:
         if self.feed:
             self.feed.stop()
         self._close_ws()
-        if self.position and self.position.status != "CLOSED":
-            log.warning("  Engine stopped with a position OPEN — it is NOT squared off. "
-                        "Restart to resume managing it, or close it in the terminal.")
+        if self.positions:
+            log.warning(f"  Engine stopped with {len(self.positions)} position(s) OPEN — "
+                        f"NOT squared off. Restart to resume managing them, or close them "
+                        f"in the terminal.")
         self._save_state()
         self._set_status("STOPPED")
 

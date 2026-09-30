@@ -2,7 +2,7 @@
 
 **Balfund Trading Pvt Ltd** | Strategy code `BF-NFT-FCOS` | Broker: **Dhan v2** | Timeframe: **5-minute, fixed**
 
-Intraday NIFTY option-selling strategy built on the first (09:15) and second (09:20) 5-minute candles of NIFTY spot and two 200-point ITM options. Five conditions run in parallel — **Condition 1, 2, 3, 5** and the **Manipulation** condition — and the first one to fire takes the only trade of the day.
+Intraday NIFTY option-selling strategy built on the first (09:15) and second (09:20) 5-minute candles of NIFTY spot and two 200-point ITM options. Five conditions run in parallel — **Condition 1, 2, 3, 5** and the **Manipulation** condition. Every condition trades independently: several can fire on the same candle or while others are in a trade, each with its own position, SL and target. Each condition side (e.g. Condition 1 PE) trades at most once a day.
 
 ## Setup of the day
 
@@ -17,30 +17,35 @@ R2                            09:20 candle high / low / open  on spot, CE, PE   
 ## Common rules
 
 ```
-option / spot "break"   wick counts
-spot "stays inside"     checked at candle close
+"break"                 wick counts
+"stays in range"        the WHOLE candle, wicks included, inside the range —
+                        for spot and options alike; once an instrument wicks
+                        out, "stays in range" has failed for the day
+"closes beyond"         candle close (the triggers of Conditions 1, 2, Manipulation)
 entry                   SELL at the close of the reversal candle
 SL                      sold option premium: max(high of reversal candle,
                         high of the candle before it) + 7
 target                  a SPOT level, fixed at the moment of entry
 exit                    SL on option LTP | target on spot LTP | 15:15 square-off
 entries                 reversal candle must close between 09:25 and 14:30
-one trade per day       the first condition to fire locks all others
+multiple trades         conditions trade independently; each condition side
+                        trades at most once a day; each position has its own
+                        SL and target; 15:15 squares off everything
 ```
 
 ## The conditions
 
 | Condition | Setup | Then | Reversal on | Sell | Target |
 |---|---|---|---|---|---|
-| **1** | spot closes inside R1; PE breaks high **and** CE breaks low | spot closes below R1 low | spot (bullish) | PE | day high |
+| **1** | spot fully inside R1 (wicks too); PE breaks high **and** CE breaks low | spot closes below R1 low | spot (bullish) | PE | day high |
 | | mirror: CE high, PE low | spot closes above R1 high | spot (bearish) | CE | day low |
-| **2** | spot breaks R1 high, CE broke high, PE untouched | new high = that spot candle's high; spot closes above it | spot (bearish) | CE | first-candle open |
-| | mirror: spot breaks low, PE broke high, CE untouched | close below new low | spot (bullish) | PE | first-candle open |
-| **3** | spot breaks R1 high, CE and PE both untouched | CE breaks its R1 high | CE (bearish) | CE | day low |
+| **2** | spot breaks R1 high, CE broke high, PE fully inside | new high = that spot candle's high; spot closes above it | spot (bearish) | CE | first-candle open |
+| | mirror: spot breaks low, PE broke high, CE fully inside | close below new low | spot (bullish) | PE | first-candle open |
+| **3** | spot breaks R1 high, CE and PE both fully inside | CE breaks its R1 high | CE (bearish) | CE | day low |
 | | mirror: spot breaks low | PE breaks its R1 high | PE (bearish) | PE | day high |
-| **5** | spot closes inside; CE breaks high, PE untouched | reversal #1 → peak 1 = CE swing high → CE breaks peak 1 | CE (bearish) #2 | CE | day low |
+| **5** | spot fully inside (wicks too); CE breaks high, PE fully inside | reversal #1 → peak 1 = CE swing high → CE breaks peak 1 | CE (bearish) #2 | CE | day low |
 | | mirror on PE | | PE (bearish) #2 | PE | day high |
-| **Manipulation** | as Condition 1, on **R2** | spot closes ≥ 10 points beyond R2 | spot | PE / CE | day high / low |
+| **Manipulation** | as Condition 1, on **R2** (spot fully inside R2) | spot closes ≥ 10 points beyond R2 | spot | PE / CE | day high / low |
 
 Conditions 2 and 3 are decided on the **first** candle where spot breaks that side of R1.
 
@@ -71,7 +76,7 @@ Carried over from `sensex-vwap-ladder`:
 
 ## Restarts
 
-`fcos_daily_state.json` records today's strikes, whether a trade was taken, and any open position. A restart the same day resumes managing the position and will not enter again. Started mid-day, the app replays today's candles to rebuild every condition's state; replayed candles can never trigger an entry.
+`fcos_daily_state.json` records today's strikes, which condition sides have traded, and every open position. A restart the same day resumes managing the open positions, and a condition side that already traded will not trade again. Started mid-day, the app replays today's candles to rebuild every condition's state; replayed candles can never trigger an entry.
 
 ## Running
 

@@ -36,17 +36,22 @@ w._handle("strategy", s.snapshot())
 check("C1-PE row shows armed", "armed" in w.rows["C1-PE"][0].cget("text"), w.rows["C1-PE"][0].cget("text"))
 check("ranges filled", "SPOT" in w.ranges.get("1.0", "end"))
 
-pos = {"condition": "C1", "side": "PE", "security_id": "1", "strike": 24200, "qty": 65,
-       "entry": 306.0, "sl": 347.0, "target": 24050.0, "target_kind": "day_high",
+pos = {"key": "C1-PE", "condition": "C1", "side": "PE", "security_id": "1", "strike": 24200,
+       "qty": 65, "entry": 306.0, "sl": 347.0, "target": 24050.0, "target_kind": "day_high",
        "pattern": "hammer", "entry_time": "09:35:01", "order_id": "PAPER", "status": "OPEN",
-       "exit": 0.0, "exit_time": "", "reason": ""}
+       "exit": 0.0, "exit_time": "", "reason": "", "retry_at": 0.0}
+pos2 = dict(pos, key="C2-CE", condition="C2", side="CE", strike=23800, entry=360.0,
+            sl=382.0, target=24000.0, target_kind="first_open")
+rows = [dict(pos, ltp=300.0, pnl=390.0), dict(pos2, ltp=355.0, pnl=325.0)]
 w._handle("tick", {"status": "IN TRADE", "mode": "paper",
-                   "ltp": {"SPOT": 23990.0, "CE": 290.0, "PE": 300.0},
-                   "day_high": 24050.0, "day_low": 23930.0, "position": pos, "upnl": 390.0,
-                   "realised": 0.0, "ws": True, "packets": 10, "avg_lag": 1.2,
-                   "max_lag": 2.0, "traded_today": True})
-check("position shown", "SHORT PE" in w.pos_lbl.cget("text"))
-check("uP&L shown", "+390" in w.pnl_lbl.cget("text"), w.pnl_lbl.cget("text"))
+                   "ltp": {"SPOT": 23990.0, "CE": 355.0, "PE": 300.0},
+                   "day_high": 24050.0, "day_low": 23930.0, "positions": rows, "open": 2,
+                   "upnl": 715.0, "realised": 0.0, "ws": True, "packets": 10,
+                   "avg_lag": 1.2, "max_lag": 2.0, "traded": ["C1-PE", "C2-CE"],
+                   "halted": False})
+txt = w.pos_box.get("1.0", "end")
+check("both positions listed", "C1-PE" in txt and "C2-CE" in txt, txt)
+check("day P&L shown", "+715" in w.pnl_lbl.cget("text"), w.pnl_lbl.cget("text"))
 w._handle("status", {"status": "IN TRADE"})
 w._handle("log", "hello")
 w._handle("trade_closed", dict(pos, exit=250.0, reason="TARGET"))
